@@ -351,6 +351,8 @@ private:
 	nccl_ofi_dlist pending_ack_list;
 	uint32_t progress_counter = 0;
 
+	bool supports_strong_signal;
+
 	/**
 	 * Send a range ACK via fi_send to the peer.
 	 *
@@ -371,11 +373,15 @@ private:
 
 	int do_gin_signal(const nccl_net_ofi_gin_signal_metadata_msg_t &metadata);
 
+	int do_gin_signal_and_trace(uint32_t peer_rank,
+				    nccl_net_ofi_gin_iputsignal_recv_req *req);
+
 	int iput_signal_recv_req_completion(uint32_t peer_rank, uint64_t map_key,
 					    nccl_net_ofi_gin_iputsignal_recv_req *req);
 
 	int stash_pending_ack(uint32_t peer_rank, uint16_t seq_num);
-	int iput_signal_deliver_all(uint32_t peer_rank);
+
+	int retire_completed_peer_iput_ops(uint32_t peer_rank);
 
 	friend class nccl_ofi_rdma_gin_listen_comm;
 
