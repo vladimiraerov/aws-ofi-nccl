@@ -246,6 +246,13 @@ public:
 	int flush_stale_acks();
 
 	/**
+	 * Flush all per-rail deferred operation queues. Posts all queued ops
+	 * with FI_MORE except the last one per rail, which rings the doorbell.
+	 * Called from ginProgress after the batch of iputSignal submissions.
+	 */
+	int flush_all_rails();
+
+	/**
 	 * iputSignal API. Transfers some user data (determined by memory registrations
 	 * and offsets) via RDMA write. When the data transfer is complete, a signal
 	 * operation is performed at the destination, at location given by
@@ -350,6 +357,16 @@ private:
 	   Only these are visited by flush_stale_acks(). */
 	nccl_ofi_dlist pending_ack_list;
 	uint32_t progress_counter = 0;
+
+	/* Per-rail deferred operation queues for doorbell coalescing.
+	   Operations are queued here with FI_MORE during iputSignal and
+	   flushed (posted to the NIC) in ginProgress via flush_all_rails().
+	   The last op per rail is posted without FI_MORE, ringing a single
+	   doorbell for the entire batch. */
+	static constexpr uint16_t DOORBELL_BATCH_SIZE = 16;
+	std::vector<nccl_net_ofi_gin_op_req_t *> deferred_ops[MAX_NUM_RAILS];
+
+	int flush_rail(uint16_t rail_id);
 
 	/* Controls signal delivery ordering on this communicator
 	   (env: OFI_NCCL_GIN_STRONG_SIGNAL, default true).

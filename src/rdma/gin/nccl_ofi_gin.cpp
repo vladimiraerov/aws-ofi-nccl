@@ -468,7 +468,6 @@ int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr
 		       srcOff, srcMhandle, size, dstOff, dstMhandle, dst_rank, signalOff,
 		       signalMhandle, signalValue, signalOp, msg_seq_num, is_ack_requested);
 
-	int ret = 0;
 	std::array<nccl_net_ofi_gin_write_req_t *, MAX_NUM_RAILS> write_reqs {};
 	nccl_net_ofi_gin_metadata_send_req_t *send_req = nullptr;
 
@@ -510,11 +509,10 @@ int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr
 			nccl_net_ofi_xfer_info_t *xfer_info = &xfers[rail_it];
 			void *desc = fi_mr_desc(src_mhandle->get_mr(xfer_info->rail_id));
 
-			/* Set FI_MORE on the first write when it shares a rail
-			 * with the subsequent metadata send */
-			uint64_t wr_flags = FI_REMOTE_CQ_DATA;
-			if (coalesce_with_metadata && rail_it == 0)
-				wr_flags |= FI_MORE;
+			/* All writes are created with FI_MORE | FI_REMOTE_CQ_DATA.
+			 * The last op per rail will have FI_MORE cleared at
+			 * flush time to ring the doorbell. */
+			uint64_t wr_flags = FI_REMOTE_CQ_DATA | FI_MORE;
 
 			auto write_req = resources.get_req_from_pool<nccl_net_ofi_gin_write_req_t>(
 				gin_ep.get_rail(xfer_info->rail_id).ofi_ep.get(),
@@ -526,17 +524,9 @@ int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr
 			write_reqs[wr_it++] = write_req;
 			NCCL_OFI_TRACE_GIN_WRITE_BEGIN(dev, xfer_info->rail_id, xfer_info->msg_size,
 						       this, dst_rank, msg_seq_num, write_req);
-			ret = write_req->post();
-			if (ret == -FI_EAGAIN) {
-				resources.add_pending_req(write_req);
-				ret = 0;
-			} else if (OFI_UNLIKELY(ret != 0)) {
-				NCCL_OFI_WARN("Write failed for seq_num %hu", msg_seq_num);
-				resources.return_req_to_pool(write_req);
-				nccl_net_ofi_release_schedule(scheduler, schedule);
-				resources.return_req_to_pool(req);
-				return ret;
-			}
+
+			/* Defer posting — will be flushed in ginProgress */
+			deferred_ops[xfer_info->rail_id].push_back(write_req);
 		}
 		nccl_net_ofi_release_schedule(scheduler, schedule);
 	}
@@ -590,25 +580,36 @@ int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr
 			metadata_send->ack.ack_count = 0;
 		}
 
-		/* This send flushes the QP work queue on the first rail,
-		   issuing a doorbell that includes the coalesced writedata
-		   WQE posted with FI_MORE above. */
+		/* Metadata send is also deferred with FI_MORE. The last op
+		   per rail will have FI_MORE cleared at flush time, ringing
+		   a single doorbell for the entire batch. */
 		send_req = resources.get_req_from_pool<nccl_net_ofi_gin_metadata_send_req_t>(
 			gin_ep.get_rail(rail_id).ofi_ep.get(), rail_id, metadata_elem,
 			rank_comm.address[rail_id], metadata_fl.get(), this, dev, dst_rank,
-			msg_seq_num);
+			msg_seq_num, FI_MORE);
 
 		NCCL_OFI_TRACE_GIN_METADATA_SEND_BEGIN(dev, rail_id, this, dst_rank, msg_seq_num,
 						       send_req);
-		ret = send_req->post();
-		if (ret == -FI_EAGAIN) {
-			resources.add_pending_req(send_req);
-			ret = 0;
-		} else if (OFI_UNLIKELY(ret != 0)) {
-			NCCL_OFI_WARN("Metadata send failed for seq_num %hu", msg_seq_num);
-			resources.return_req_to_pool(send_req);
-			resources.return_req_to_pool(req);
-			return ret;
+
+		/* Defer posting — will be flushed in ginProgress */
+		deferred_ops[rail_id].push_back(send_req);
+	}
+
+	/* Auto-flush any rail that crossed the batch threshold.
+	   Writes from this iputSignal were striped across rails above, and
+	   the optional metadata send on rail_id may have also tipped its
+	   queue. Scan every rail so the doorbell fires promptly regardless
+	   of which rails accumulated work. */
+	{
+		auto &gin_ep_flush = resources.get_ep();
+		const uint16_t num_rails_flush =
+			static_cast<uint16_t>(gin_ep_flush.get_num_rails());
+		for (uint16_t r = 0; r < num_rails_flush; r++) {
+			if (deferred_ops[r].size() >= DOORBELL_BATCH_SIZE) {
+				int ret = flush_rail(r);
+				if (OFI_UNLIKELY(ret != 0))
+					return ret;
+			}
 		}
 	}
 
@@ -914,6 +915,45 @@ int nccl_ofi_rdma_gin_put_comm::handle_ack_completion(fi_addr_t src_addr, uint16
 	   in any order. A single ack_seq_num would require cumulative
 	   state that breaks under reordering. */
 	clear_ack_range(peer_rank, ack_seq_num, count);
+	return 0;
+}
+
+int nccl_ofi_rdma_gin_put_comm::flush_rail(uint16_t rail_id)
+{
+	auto &ops = deferred_ops[rail_id];
+	if (ops.empty())
+		return 0;
+
+	/* Post all ops. The last one has FI_MORE cleared so it rings
+	   the doorbell for the entire batch on this rail. */
+	size_t last = ops.size() - 1;
+	for (size_t i = 0; i <= last; i++) {
+		if (i == last)
+			ops[i]->clear_fi_more();
+
+		int ret = ops[i]->post();
+		if (ret == -FI_EAGAIN) {
+			resources.add_pending_req(ops[i]);
+		} else if (OFI_UNLIKELY(ret != 0)) {
+			NCCL_OFI_WARN("flush_rail: post failed on rail %hu, RC: %d",
+				      rail_id, ret);
+			ops.erase(ops.begin(), ops.begin() + (long)(i + 1));
+			return ret;
+		}
+	}
+	ops.clear();
+	return 0;
+}
+
+int nccl_ofi_rdma_gin_put_comm::flush_all_rails()
+{
+	auto &gin_ep = resources.get_ep();
+	int num_rails = static_cast<int>(gin_ep.get_num_rails());
+	for (int r = 0; r < num_rails; r++) {
+		int ret = flush_rail(static_cast<uint16_t>(r));
+		if (OFI_UNLIKELY(ret != 0))
+			return ret;
+	}
 	return 0;
 }
 

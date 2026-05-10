@@ -89,6 +89,12 @@ public:
 	virtual int post() = 0;
 
 	/**
+	 * Clear FI_MORE from the request flags. Called by flush_rail on the
+	 * last op in the batch to ring the doorbell.
+	 */
+	virtual void clear_fi_more() {}
+
+	/**
 	 * Handle completion of the request. This needs to be implemented by the
 	 * derived class.
 	 *
@@ -297,6 +303,8 @@ public:
 	{
 	}
 
+	void clear_fi_more() override { flags &= ~FI_MORE; }
+
 	int post() override;
 
 	int handle_cq_entry(struct fi_cq_entry * /*cq_entry_base*/, fi_addr_t /*src_addr*/,
@@ -349,12 +357,14 @@ public:
 					     fi_addr_t remote_addr_arg,
 					     nccl_ofi_freelist *metadata_fl_arg, void *comm_arg,
 					     int dev_arg, uint32_t rank_arg,
-					     uint16_t msg_seq_num_arg)
+					     uint16_t msg_seq_num_arg, uint64_t msg_flags = 0)
 	    : comm(comm_arg), dev(dev_arg), rank(rank_arg), msg_seq_num(msg_seq_num_arg),
 	      ep(ep_arg), rail_id(rail_id_arg), metadata_elem(metadata_elem_arg),
-	      remote_addr(remote_addr_arg), metadata_fl(metadata_fl_arg)
+	      remote_addr(remote_addr_arg), metadata_fl(metadata_fl_arg), flags(msg_flags)
 	{
 	}
+
+	void clear_fi_more() override { flags &= ~FI_MORE; }
 
 	int post() override;
 
@@ -386,6 +396,8 @@ private:
 	nccl_ofi_freelist::fl_entry *metadata_elem;
 	fi_addr_t remote_addr;
 	nccl_ofi_freelist *metadata_fl;
+	/* Flags for fi_sendmsg. On retry FI_MORE is dropped. */
+	uint64_t flags;
 };
 
 /**

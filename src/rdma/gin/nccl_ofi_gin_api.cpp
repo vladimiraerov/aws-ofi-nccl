@@ -252,7 +252,16 @@ ncclResult_t nccl_ofi_gin_deregMrSym(void *collComm, void *mhandle)
 ncclResult_t nccl_ofi_gin_ginProgress(void *collComm)
 {
 	auto *gin_comm = static_cast<nccl_ofi_rdma_gin_put_comm *>(collComm);
-	int ret = gin_comm->get_resources().progress();
+
+	/* Flush all per-rail deferred operation queues. This posts the
+	   batched writes and sends accumulated during this progress
+	   iteration's iputSignal calls, ringing one doorbell per rail. */
+	int ret = gin_comm->flush_all_rails();
+	if (OFI_UNLIKELY(ret != 0)) {
+		return nccl_net_ofi_retval_translate(ret);
+	}
+
+	ret = gin_comm->get_resources().progress();
 	if (OFI_UNLIKELY(ret != 0)) {
 		return nccl_net_ofi_retval_translate(ret);
 	}
