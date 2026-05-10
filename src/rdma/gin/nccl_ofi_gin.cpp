@@ -423,8 +423,11 @@ int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr
 	auto &rank_comm = rank_comms[dst_rank];
 	uint16_t msg_seq_num = rank_comm.next_target_seq_num;
 	uint32_t remote_comm_id = rank_comm.comm_id;
-	uint16_t rail_id = resources.get_next_rail();
 	auto scheduler = gin_ep.get_scheduler();
+	/* rail_id for metadata send is determined below: either from the
+	   scheduler's first write rail (for coalescing) or from
+	   get_next_rail() when there is no data to coalesce with. */
+	uint16_t rail_id = 0;
 
 	if (OFI_UNLIKELY(rank_comm.active_put_signal.test(msg_seq_num & GIN_IMM_SEQ_MASK))) {
 		NCCL_OFI_WARN("Next sequence number is in use");
@@ -493,15 +496,32 @@ int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr
 		uint64_t dest = dest_remote_mr.address_offset + dstOff;
 		int wr_it = 0;
 
+		/* When sending both data and metadata (put+signal), colocate
+		 * the first write and the metadata send on the same rail.
+		 * The first write is posted with FI_MORE to hint the provider
+		 * that more operations follow on this EP, enabling doorbell
+		 * coalescing (single PCIe doorbell for write + send). */
+		bool coalesce_with_metadata = (signalOp != 0);
+		if (coalesce_with_metadata) {
+			rail_id = xfers[0].rail_id;
+		}
+
 		for (uint16_t rail_it = 0; rail_it < schedule->num_xfer_infos; rail_it++) {
 			nccl_net_ofi_xfer_info_t *xfer_info = &xfers[rail_it];
 			void *desc = fi_mr_desc(src_mhandle->get_mr(xfer_info->rail_id));
+
+			/* Set FI_MORE on the first write when it shares a rail
+			 * with the subsequent metadata send */
+			uint64_t wr_flags = FI_REMOTE_CQ_DATA;
+			if (coalesce_with_metadata && rail_it == 0)
+				wr_flags |= FI_MORE;
+
 			auto write_req = resources.get_req_from_pool<nccl_net_ofi_gin_write_req_t>(
 				gin_ep.get_rail(xfer_info->rail_id).ofi_ep.get(),
 				(void *)((uintptr_t)src + xfer_info->offset), xfer_info->msg_size,
 				desc, data, rank_comm.address[xfer_info->rail_id],
 				dest + xfer_info->offset, dest_remote_mr.mr_key[xfer_info->rail_id],
-				this, dev, dst_rank, msg_seq_num);
+				this, dev, dst_rank, msg_seq_num, wr_flags);
 
 			write_reqs[wr_it++] = write_req;
 			NCCL_OFI_TRACE_GIN_WRITE_BEGIN(dev, xfer_info->rail_id, xfer_info->msg_size,
@@ -527,6 +547,11 @@ int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr
 	nccl_ofi_freelist::fl_entry *metadata_elem = nullptr;
 
 	if (signalOp != 0) {
+		/* For signal-only (size == 0), no write was posted so we
+		   cannot coalesce — pick a rail via round-robin. */
+		if (size == 0)
+			rail_id = resources.get_next_rail();
+
 		/* Post metadata send with signal information */
 
 		metadata_elem = metadata_fl.get()->entry_alloc();
@@ -565,6 +590,9 @@ int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr
 			metadata_send->ack.ack_count = 0;
 		}
 
+		/* This send flushes the QP work queue on the first rail,
+		   issuing a doorbell that includes the coalesced writedata
+		   WQE posted with FI_MORE above. */
 		send_req = resources.get_req_from_pool<nccl_net_ofi_gin_metadata_send_req_t>(
 			gin_ep.get_rail(rail_id).ofi_ep.get(), rail_id, metadata_elem,
 			rank_comm.address[rail_id], metadata_fl.get(), this, dev, dst_rank,
